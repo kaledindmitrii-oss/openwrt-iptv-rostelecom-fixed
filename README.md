@@ -1,151 +1,154 @@
-# OpenWrt IPTV Rostelecom — Fixed
+# OpenWrt IPTV Ростелеком — Fixed
 
-Независимый исправленный аналог проекта `v1rtuozz/openwrt-iptv-rostelecom`.
+Независимый исправленный аналог `v1rtuozz/openwrt-iptv-rostelecom`.
 
-**Этот проект НЕ является частью Universal OpenWrt.**
+**Проект НЕ является частью Universal OpenWrt.**
 
-## Что исправлено
+## Что изменено в 4.1.0
 
-- Нет захардкоженного MAC-адреса WAN.
-- Скрипт не заменяет целиком `/etc/config/network`, `firewall`, `dhcp`, `igmpproxy`.
-- Создаются только собственные UCI-секции с префиксом `rt_iptv_*`.
-- Существующая WAN-конфигурация не меняется без явного согласия пользователя.
-- Нет обязательной загрузки конфигов с GitHub во время установки.
-- Поддерживаются `opkg` для старых OpenWrt и `apk` для OpenWrt 25.12+.
-- IPTV-порт выбирается по фактическому интерфейсу `/sys/class/net`.
-- Перед установкой создаётся отдельный backup.
-- Есть `status`, `restore`, `uninstall`.
-- Региональные multicast source IP можно добавлять командой `add-altnet`.
-- Firewall использует отдельные зоны `iptv` и `iptv_lan`, а не предполагает, что имя interface является zone.
-- Встроена проверка UCI-конфигурации перед применением.
-- VLAN/bridge WAN топологии не угадываются автоматически: скрипт предупреждает об этом, чтобы не сломать сеть.
+- Исправлена работа с UCI `list ports`.
+- Физические Ethernet-порты определяются по `/sys/class/net/*/device`, без исключения `eth0`/`eth1` по имени.
+- Установщик не меняет WAN/PPPoE.
+- Без аргументов запускается простое меню.
+- Добавлена пост-проверка после установки.
+- Hotplug создаётся отдельным файлом `99-iptv-rostelecom` и не перезаписывает чужой hook.
+- Усилена защита от ошибочной установки на bridge/VLAN/virtual interface.
+- Сохраняются backup, rollback, uninstall и диагностика.
 
-## Совместимость
+OpenWrt использует DSA на современных устройствах; для сложных VLAN-топологий OpenWrt рекомендует bridge/VLAN-конфигурацию, поэтому проект намеренно не пытается угадывать DSA VLAN-схему. citeturn0search0turn0search2
 
-Проект ориентирован на OpenWrt 23.05, 24.10 и 25.12+.
-
-На 22 сентября 2026 года актуальная стабильная ветка OpenWrt — 25.12; последняя версия — 25.12.5. В OpenWrt 25.12 пакетный менеджер сменился с `opkg` на `apk`.
-
-## Установка
-
-Скопируйте `iptv-manager.sh` на роутер:
+## Быстрый запуск
 
 ```sh
 scp iptv-manager.sh root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
 chmod +x /tmp/iptv-manager.sh
+/tmp/iptv-manager.sh
+```
+
+Откроется меню:
+
+```text
+1) Установить IPTV
+2) Проверить состояние
+3) Диагностика
+4) Показать порты
+5) Показать конфигурацию
+6) Создать backup
+7) Удалить IPTV
+0) Выход
+```
+
+Для автоматизации доступны команды:
+
+```sh
 /tmp/iptv-manager.sh install
+/tmp/iptv-manager.sh status
+/tmp/iptv-manager.sh diagnose
+/tmp/iptv-manager.sh list-ports
+/tmp/iptv-manager.sh show-config
+/tmp/iptv-manager.sh backup
+/tmp/iptv-manager.sh restore
+/tmp/iptv-manager.sh uninstall
 ```
 
-Либо:
+## Classic IPTV
+
+`install` рассчитан на классическую схему multicast + IGMP proxy с отдельным физическим Ethernet-портом для приставки.
+
+Установщик:
+
+1. определяет OpenWrt и WAN device;
+2. проверяет/устанавливает `igmpproxy` через доступный пакетный менеджер;
+3. показывает физические Ethernet-порты;
+4. просит выбрать IPTV-порт;
+5. создаёт backup;
+6. убирает выбранный порт из существующего bridge через UCI list-операции;
+7. создаёт `br-rt-iptv` с IGMP snooping;
+8. создаёт `rt_iptv_lan` и DHCP;
+9. создаёт отдельные firewall zones/rules;
+10. настраивает `igmpproxy`;
+11. применяет конфигурацию и выполняет пост-проверку.
+
+WAN credentials и PPPoE установщик не изменяет.
+
+## VLAN
+
+Если конкретная схема Ростелекома требует VLAN, VLAN ID должен быть известен заранее.
+
+Пример старого/простого L2 parent:
 
 ```sh
-sh /tmp/iptv-manager.sh
+/tmp/iptv-manager.sh install-vlan eth0 100 lan4
 ```
 
-Без аргумента выполняется `install`.
+`100` — только пример. Проект не утверждает, что это VLAN Ростелекома.
 
-Скрипт:
+Для DSA-схем, где VLAN должен быть построен через `br-lan.<VID>`/`bridge-vlan`, используйте штатную UCI/LuCI-конфигурацию OpenWrt. Не переносите пример `eth0.<VID>` на DSA-роутер вслепую. OpenWrt прямо описывает различия между legacy swconfig и DSA. citeturn0search0turn0search1
 
-1. определит OpenWrt;
-2. проверит/установит `igmpproxy`;
-3. покажет доступные интерфейсы;
-4. попросит выбрать физический порт для IPTV;
-5. сохранит backup;
-6. создаст отдельный IPTV bridge;
-7. создаст DHCP для IPTV приставки;
-8. создаст firewall-зоны и forwarding;
-9. настроит IGMP proxy;
-10. перезапустит нужные службы.
+## Multicast source / altnet
 
-## Важное ограничение
+В проекте сохранён стартовый набор source IP из исходного аналога. Он не считается универсальным для всех регионов.
 
-Это решение рассчитано на классический **multicast IPTV + IGMP proxy**.
-
-Ростелеком может использовать разные схемы по регионам и доступам. Если IPTV приходит через отдельный VLAN, нельзя безопасно угадать VLAN ID автоматически. В таком случае сначала нужно определить VLAN/портовую схему конкретного подключения.
-
-## Если Wink показывает 2-9 / Multicast unavailable
-
-Посмотрите логи:
-
-```sh
-logread -f | grep -i igmp
-```
-
-Если в логе появляется адрес multicast source, добавьте его:
+Добавить источник:
 
 ```sh
 /tmp/iptv-manager.sh add-altnet 212.12.12.236
 ```
 
-Проверить конфигурацию:
+Удалить источник:
+
+```sh
+/tmp/iptv-manager.sh remove-altnet 212.12.12.236
+```
+
+Не следует без необходимости разрешать весь IPv4 диапазон как `altnet`: смысл `altnet` — ограничивать допустимые multicast sources.
+
+## Диагностика
 
 ```sh
 /tmp/iptv-manager.sh status
+/tmp/iptv-manager.sh diagnose
 ```
 
-## Откат
+Полезные системные команды:
 
-Перед установкой сохраняется backup в:
+```sh
+cat /proc/net/igmp
+logread -f | grep -Ei 'igmp|igmpproxy|multicast|netifd'
+fw4 print | grep -Ei 'rt_iptv|224\.0\.0\.0/4|igmpproxy'
+```
+
+## Backup / rollback
+
+Перед установкой создаётся backup:
 
 ```text
 /root/iptv-rostelecom-backups/
 ```
 
-Полный откат к последнему backup:
+Восстановление:
 
 ```sh
 /tmp/iptv-manager.sh restore
 ```
 
-Удаление только конфигурации проекта:
+`restore` заменяет сохранённые целиком файлы `network`, `firewall`, `dhcp`, `igmpproxy`. Используйте его именно как аварийный rollback к состоянию backup.
 
-```sh
-/tmp/iptv-manager.sh uninstall
-```
+`uninstall` удаляет только секции проекта и не делает полный откат пользовательских изменений.
 
-`uninstall` не создаёт новый backup поверх pre-install backup.
+## Важные ограничения
 
-## Архитектура
+- Это не официальная конфигурация Ростелекома.
+- Multicast topology может отличаться по региону, доступу и оборудованию.
+- Не угадывается VLAN ID.
+- Полную IPTV-проверку нельзя выполнить без реального OpenWrt-роутера и действующего подключения.
+- Статические `10.0.0.1/24` и `192.168.100.1/24` сохранены как совместимость с исходной схемой; если конкретное подключение использует другую L2/L3 схему, параметры нужно адаптировать.
 
-```text
-Ростелеком multicast
-        |
-     WAN L2
-        |
-   rt_iptv / igmpproxy
-        |
-  br-rt-iptv
-        |
- IPTV Ethernet port
-        |
-   Wink / приставка
-```
-
-Основные UCI-секции:
-
-- `network.rt_iptv`
-- `network.rt_iptv_lan`
-- `network.rt_iptv_dev`
-- `dhcp.rt_iptv_dhcp`
-- `firewall.rt_iptv_*`
-- `igmpproxy.rt_iptv_*`
-
-## Что НЕ делает проект
-
-- не меняет Universal OpenWrt;
-- не прошивает роутер;
-- не угадывает VLAN Ростелекома;
-- не заменяет WAN-конфигурацию без подтверждения;
-- не обещает работу IPTV в регионах, где provider topology отличается;
-- не является официальной конфигурацией Ростелекома.
-
-## Проверка перед реальным использованием
-
-В текущей среде можно проверить синтаксис shell:
+## Проверка проекта
 
 ```sh
 sh -n iptv-manager.sh
 ```
 
-Полноценную проверку multicast нельзя выполнить без конкретного роутера и действующего подключения Ростелекома.
+Также проект содержит GitHub Actions для shell syntax/ShellCheck.
