@@ -1,4 +1,4 @@
-# Deep audit — v4.3.2
+# Deep audit — v4.3.3
 
 ## Scope
 
@@ -32,7 +32,7 @@
 
 Для DSA VLAN OpenWrt использует `bridge-vlan`; проект намеренно не создаёт такую топологию автоматически без данных о конкретном роутере и схеме провайдера.
 
-## 4.3.2 hardening
+## 4.3.3 hardening
 
 1. **Project-scoped automatic rollback** — критическая ошибка установки больше не восстанавливает целиком четыре `/etc/config/*` файла. Откатываются только проектные UCI-секции, выбранный IPTV-порт и проектный hotplug.
 2. **PPPoE/logical WAN** — Classic проверяет наличие `network.wan`, но не требует, чтобы `network.wan.device` был физическим `eth*`/`lan*`. Это позволяет не блокировать логические WAN topology без изменения WAN credentials.
@@ -42,3 +42,16 @@
 ## Remaining runtime limitation
 
 Без реального роутера и активной линии Ростелекома нельзя доказать E2E multicast forwarding, корректность конкретного регионального VLAN ID или полный набор source IP. Эти параметры остаются topology-dependent.
+
+
+## Дополнительный проход 4.3.3
+
+- Проверен жизненный цикл `backup → staged UCI → commit → reload → state`.
+- Обнаружен и исправлен риск в полном `restore`: `uci commit` после прямой замены файлов мог сохранить старые staged changes поверх backup.
+- Проверена обработка пользовательского hotplug при ошибках копирования/chmod.
+- Проверена последовательность установки пакета `igmpproxy`: интерактивная отмена теперь не оставляет неожиданный пакет после выбора порта.
+- Проверен UX мастера: link state, bridge membership, явное подтверждение и понятное предупреждение перед отделением порта.
+- GitHub Actions не использует сторонний ShellCheck action; используется ShellCheck 0.9.0 из Ubuntu 24.04 runner image и полный SHA для checkout. Runner image содержит ShellCheck в установленном наборе ПО.
+- Остаётся обязательное ограничение: без реальной линии Ростелекома нельзя доказать E2E multicast, конкретный VLAN ID и региональный набор source IP.
+
+- Firewall downstream reviewed: management exposure reduced by default (`input REJECT`) while DHCP/DNS/IGMP remain explicitly allowed; multicast forwarding remains a dedicated forwarded rule.

@@ -1,12 +1,13 @@
 #!/bin/sh
 # OpenWrt IPTV Rostelecom Manager
 # Independent project - NOT part of Universal OpenWrt
-# Version: 4.3.2
+# Version: 4.3.3
 # Simple interactive UI + safe UCI changes + multicast diagnostics.
 
 set -u
 
-VERSION="4.3.2"
+INSTALL_ACTIVE=0
+VERSION="4.3.3"
 PROJECT="iptv-rostelecom"
 STATE_DIR="/etc/iptv-rostelecom"
 BACKUP_DIR="/root/iptv-rostelecom-backups"
@@ -19,14 +20,79 @@ ALTNETS="198.18.20.5/32 10.179.47.27/32 10.171.151.11/32 212.12.12.235/32 212.12
 
 
 log() { printf '%s\n' "$*"; }
-die() { log "\nОШИБКА: $*"; exit 1; }
-is_root() { [ "$(id -u 2>/dev/null)" = "0" ] || die "Запустите скрипт от root."; mkdir -p "$STATE_DIR" "$BACKUP_DIR" || die "Не удалось создать каталог состояния."; require_openwrt; }
+die() {
+    log ""
+    log "ОШИБКА: $*"
+    if [ "${INSTALL_ACTIVE:-0}" = "1" ]; then
+        INSTALL_ACTIVE=0
+        rollback_project
+        log "Проектные изменения автоматически откатаны."
+    fi
+    exit 1
+}
+is_root() {
+    [ "$(id -u 2>/dev/null)" = "0" ] || die "Запустите скрипт от root."
+    require_openwrt
+    mkdir -p "$STATE_DIR" "$BACKUP_DIR" || die "Не удалось создать каталог состояния."
+}
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Не найдена команда: $1"; }
-require_openwrt() { [ -r /etc/openwrt_release ] || die "Это не похоже на OpenWrt."; require_cmd uci; require_cmd ip; require_cmd awk; }
+require_openwrt() {
+    [ -r /etc/openwrt_release ] || die "Это не похоже на OpenWrt."
+    require_cmd uci
+    require_cmd ip
+    require_cmd awk
+    require_cmd sed
+    require_cmd grep
+    require_cmd tr
+    require_cmd cp
+    require_cmd mv
+    require_cmd date
+}
 uci_get() { uci -q get "$1" 2>/dev/null; }
 uci_del() { uci -q delete "$1" 2>/dev/null || true; }
 confirm() { printf "%s [y/N]: " "$1"; read -r ans; case "$ans" in y|Y|д|Д) return 0;; *) return 1;; esac; }
-openwrt_version() { [ -r /etc/openwrt_release ] || die "Это не похоже на OpenWrt."; . /etc/openwrt_release; printf '%s' "${DISTRIB_RELEASE:-unknown}"; }
+openwrt_version() {
+    [ -r /etc/openwrt_release ] || die "Это не похоже на OpenWrt."
+    # shellcheck disable=SC1091
+    . /etc/openwrt_release
+    printf '%s' "${DISTRIB_RELEASE:-unknown}"
+}
+
+port_link_state() {
+    port="$1"
+    if [ -r "/sys/class/net/$port/carrier" ]; then
+        if [ "$(cat "/sys/class/net/$port/carrier" 2>/dev/null)" = "1" ]; then
+            printf 'подключён'
+        else
+            printf 'не подключён'
+        fi
+    elif [ -r "/sys/class/net/$port/operstate" ]; then
+        cat "/sys/class/net/$port/operstate"
+    else
+        printf 'неизвестно'
+    fi
+}
+validate_port_name() {
+    case "$1" in ''|*[!A-Za-z0-9_-]*) return 1;; esac
+    return 0
+}
+port_bridge_membership() {
+    port="$1"
+    found=""
+    while IFS= read -r sec; do
+        [ -n "$sec" ] || continue
+        name="$(uci_get "network.$sec.name")"
+        ports="$(uci_get "network.$sec.ports")"
+        case " $ports " in *" $port "*) found="${found}${found:+, }${name:-$sec}";; esac
+    done <<EOF3
+$(uci show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=device$/\1/p')
+EOF3
+    if [ -n "$found" ]; then
+        printf '%s' "$found"
+    else
+        printf 'нет'
+    fi
+}
 
 pause_ui() { printf '\nНажмите Enter для продолжения...'; read -r _; }
 header() { clear 2>/dev/null || true; printf '\n========================================\n  OpenWrt IPTV Ростелеком  v%s\n========================================\n' "$VERSION"; }
@@ -38,7 +104,14 @@ pkg_install() {
         opkg install igmpproxy >/dev/null 2>&1 || { opkg update >/dev/null 2>&1 || true; opkg install igmpproxy || die "Не удалось установить igmpproxy через opkg."; }
     else die "Не найден apk/opkg."; fi
 }
-ensure_igmpproxy() { command -v igmpproxy >/dev/null 2>&1 && return 0; log "Устанавливаю igmpproxy..."; pkg_install; command -v igmpproxy >/dev/null 2>&1 || die "igmpproxy после установки не найден."; }
+ensure_igmpproxy() {
+    if command -v igmpproxy >/dev/null 2>&1; then
+        return 0
+    fi
+    log "Устанавливаю igmpproxy..."
+    pkg_install
+    command -v igmpproxy >/dev/null 2>&1 || die "igmpproxy после установки не найден."
+}
 timestamp() { date '+%Y%m%d-%H%M%S'; }
 
 backup() {
@@ -64,26 +137,36 @@ latest_backup() {
         printf '%s\n' "$dir"
     done | sort | tail -n 1
 }
+restore_file() {
+    src="$1"; dst="$2"; tmp="${dst}.restore.$$"
+    cp -p "$src" "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$dst" || { rm -f "$tmp"; return 1; }
+}
 restore_backup() {
     is_root
-    dir="$(latest_backup)"; [ -n "$dir" ] && [ -d "$dir" ] || die "Резервная копия не найдена."
+    dir="$(latest_backup)"
+    if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+        die "Резервная копия не найдена."
+    fi
     log "Восстановление из: $dir"
     /etc/init.d/igmpproxy stop >/dev/null 2>&1 || true
     for f in network firewall dhcp igmpproxy; do
-        if [ -f "$dir/$f" ]; then cp "$dir/$f" "/etc/config/$f"; elif [ -f "$dir/$f.missing" ]; then rm -f "/etc/config/$f"; fi
+        if [ -f "$dir/$f" ]; then restore_file "$dir/$f" "/etc/config/$f" || die "Не удалось восстановить /etc/config/$f";
+        elif [ -f "$dir/$f.missing" ]; then rm -f "/etc/config/$f" || die "Не удалось удалить /etc/config/$f"; fi
     done
-    if [ -f "$dir/hotplug" ]; then cp "$dir/hotplug" "$HOTPLUG_FILE"; chmod +x "$HOTPLUG_FILE"; elif [ -f "$dir/hotplug.missing" ]; then rm -f "$HOTPLUG_FILE"; fi
-    if [ -f "$dir/project-config" ]; then cp "$dir/project-config" "$CONFIG_FILE"; elif [ -f "$dir/project-config.missing" ]; then rm -f "$CONFIG_FILE"; fi
-    if [ -f "$dir/portmap" ]; then cp "$dir/portmap" "$PORTMAP_FILE"; elif [ -f "$dir/portmap.missing" ]; then rm -f "$PORTMAP_FILE"; fi
-    if [ -f "$dir/iptv_port" ]; then cp "$dir/iptv_port" "$STATE_DIR/iptv_port"; elif [ -f "$dir/iptv_port.missing" ]; then rm -f "$STATE_DIR/iptv_port"; fi
-    if [ -f "$dir/original-hotplug" ]; then cp "$dir/original-hotplug" "$HOTPLUG_BACKUP"; elif [ -f "$dir/original-hotplug.missing" ]; then rm -f "$HOTPLUG_BACKUP"; fi
-    uci commit network; uci commit firewall; uci commit dhcp; uci commit igmpproxy
-    /etc/init.d/network reload >/dev/null 2>&1 || true
-    /etc/init.d/firewall reload >/dev/null 2>&1 || true
-    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
-    /etc/init.d/igmpproxy restart >/dev/null 2>&1 || true
+    if [ -f "$dir/hotplug" ]; then restore_file "$dir/hotplug" "$HOTPLUG_FILE" || die "Не удалось восстановить hotplug."; chmod +x "$HOTPLUG_FILE" || die "Не удалось сделать hotplug исполняемым.";
+    elif [ -f "$dir/hotplug.missing" ]; then rm -f "$HOTPLUG_FILE" || die "Не удалось удалить hotplug."; fi
+    if [ -f "$dir/project-config" ]; then restore_file "$dir/project-config" "$CONFIG_FILE" || die "Не удалось восстановить состояние проекта."; elif [ -f "$dir/project-config.missing" ]; then rm -f "$CONFIG_FILE" || die "Не удалось удалить состояние проекта."; fi
+    if [ -f "$dir/portmap" ]; then restore_file "$dir/portmap" "$PORTMAP_FILE" || die "Не удалось восстановить portmap."; elif [ -f "$dir/portmap.missing" ]; then rm -f "$PORTMAP_FILE" || die "Не удалось удалить portmap."; fi
+    if [ -f "$dir/iptv_port" ]; then restore_file "$dir/iptv_port" "$STATE_DIR/iptv_port" || die "Не удалось восстановить IPTV-порт."; elif [ -f "$dir/iptv_port.missing" ]; then rm -f "$STATE_DIR/iptv_port" || die "Не удалось удалить IPTV-порт."; fi
+    if [ -f "$dir/original-hotplug" ]; then restore_file "$dir/original-hotplug" "$HOTPLUG_BACKUP" || die "Не удалось восстановить резерв hotplug."; elif [ -f "$dir/original-hotplug.missing" ]; then rm -f "$HOTPLUG_BACKUP" || die "Не удалось удалить резерв hotplug."; fi
+    /etc/init.d/network reload >/dev/null 2>&1 || die "Network reload завершился ошибкой после restore."
+    /etc/init.d/firewall reload >/dev/null 2>&1 || die "Firewall reload завершился ошибкой после restore."
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || die "Dnsmasq restart завершился ошибкой после restore."
+    /etc/init.d/igmpproxy restart >/dev/null 2>&1 || log "Предупреждение: igmpproxy не запустился после restore."
     log "Восстановление завершено."
 }
+
 
 detect_wan_device() { WAN_DEV="$(uci_get network.wan.device)"; [ -n "${WAN_DEV:-}" ] || WAN_DEV="$(uci_get network.wan.ifname)"; [ -n "${WAN_DEV:-}" ] || WAN_DEV=""; printf '%s' "$WAN_DEV"; }
 
@@ -116,6 +199,7 @@ validate_vid() { echo "$1" | awk '$0 ~ /^[0-9]+$/ && $1 >= 1 && $1 <= 4094 {exit
 
 save_port_membership() {
     port="$1"
+    validate_port_name "$port" || die "Недопустимое имя IPTV-порта: $port"
     [ -s "$PORTMAP_FILE" ] && return 0
     : > "$PORTMAP_FILE"
     uci show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=device$/\1/p' | while IFS= read -r sec; do
@@ -154,7 +238,9 @@ remove_port_from_bridges() {
         ports="$(uci_get "network.$sec.ports")"
         [ -n "$ports" ] || continue
         printf '%s\n' "$ports" | tr ' ' '\n' | while IFS= read -r item; do
-            [ "$item" = "$port" ] && uci del_list "network.$sec.ports=$port" 2>/dev/null || true
+            if [ "$item" = "$port" ]; then
+                uci del_list "network.$sec.ports=$port" 2>/dev/null || true
+            fi
         done
     done <<EOF3
 $(uci show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=device$/\1/p')
@@ -164,14 +250,21 @@ EOF3
 select_port() {
     WAN_DEV="$(detect_wan_device)"
     log "WAN: $WAN_DEV"
-    log "\nФизические Ethernet-порты:"
+    log ""; log "Физические Ethernet-порты:"
     ports="$(list_ports)"; [ -n "$ports" ] || die "Физические Ethernet-порты не найдены."
-    printf '%s\n' "$ports" | tr ' ' '\n' | while IFS= read -r item; do printf '  %s\n' "$item"; done
+    printf '%s\n' "$ports" | while IFS= read -r item; do
+        [ -n "$item" ] || continue
+        printf '  %-12s link: %s | bridge: %s\n' "$item" "$(port_link_state "$item")" "$(port_bridge_membership "$item")"
+    done
     printf '\nВведите порт IPTV (например lan4): '; read -r IPTV_PORT
     [ -n "$IPTV_PORT" ] || die "Порт не указан."
+    validate_port_name "$IPTV_PORT" || die "Недопустимое имя физического Ethernet-порта: $IPTV_PORT"
     is_virtual_iface "$IPTV_PORT" && die "Выберите физический Ethernet-порт: $IPTV_PORT"
-    case "$IPTV_PORT" in *.*|*@*) die "Выберите физический Ethernet-порт: $IPTV_PORT";; esac
     [ -e "/sys/class/net/$IPTV_PORT/device" ] || die "Физический интерфейс не найден: $IPTV_PORT"
+    log ""; log "Выбран порт: $IPTV_PORT"
+    log "Состояние линии: $(port_link_state "$IPTV_PORT")"
+    log "Текущее bridge-членство: $(port_bridge_membership "$IPTV_PORT")"
+    log "ВАЖНО: порт будет выведен из текущего bridge и станет отдельным IPTV-портом."
     # Classic uses logical network.wan as igmpproxy upstream.
     # The WAN device may be a VLAN or PPPoE parent, so it is not required
     # to be a physical interface here.
@@ -184,10 +277,10 @@ remove_owned_config() {
     for sec in rt_iptv_lan rt_iptv_dev rt_iptv rt_iptv_vlan; do uci_del "network.$sec"; done
     uci_del dhcp.rt_iptv_dhcp
     for sec in rt_iptv_igmp rt_iptv_upstream rt_iptv_downstream; do uci_del "igmpproxy.$sec"; done
-    for sec in rt_iptv_upstream rt_iptv_downstream rt_iptv_igmp_accept rt_iptv_igmp_downstream rt_iptv_multicast; do uci_del "firewall.$sec"; done
+    for sec in rt_iptv_upstream rt_iptv_downstream rt_iptv_igmp_accept rt_iptv_igmp_downstream rt_iptv_dhcp rt_iptv_dns rt_iptv_multicast; do uci_del "firewall.$sec"; done
 }
 assert_project_names_free() {
-    for key in network.rt_iptv_lan network.rt_iptv_dev network.rt_iptv network.rt_iptv_vlan dhcp.rt_iptv_dhcp igmpproxy.rt_iptv_igmp igmpproxy.rt_iptv_upstream igmpproxy.rt_iptv_downstream firewall.rt_iptv_upstream firewall.rt_iptv_downstream firewall.rt_iptv_igmp_accept firewall.rt_iptv_igmp_downstream firewall.rt_iptv_multicast; do
+    for key in network.rt_iptv_lan network.rt_iptv_dev network.rt_iptv network.rt_iptv_vlan dhcp.rt_iptv_dhcp igmpproxy.rt_iptv_igmp igmpproxy.rt_iptv_upstream igmpproxy.rt_iptv_downstream firewall.rt_iptv_upstream firewall.rt_iptv_downstream firewall.rt_iptv_igmp_accept firewall.rt_iptv_igmp_downstream firewall.rt_iptv_dhcp firewall.rt_iptv_dns firewall.rt_iptv_multicast; do
         if uci -q get "$key" >/dev/null 2>&1; then
             die "Обнаружена существующая UCI-секция $key. Для безопасности установщик не перезаписывает чужую конфигурацию."
         fi
@@ -195,6 +288,18 @@ assert_project_names_free() {
 }
 configure_network() {
     port="$1"; wan_dev="$2"; mode="$3"; vid="${4:-}"
+    validate_port_name "$port" || return 1
+    case "$mode" in
+        classic) ;;
+        vlan)
+            validate_vid "$vid" || return 1
+            case "$wan_dev" in br-*|ppp*|tun*|wg*|*.*) return 1;; esac
+            ;;
+        *) return 1;;
+    esac
+    if [ -n "${IGMP_VERSION:-}" ]; then
+        case "$IGMP_VERSION" in 1|2|3) ;; *) return 1;; esac
+    fi
     remove_owned_config
     remove_port_from_bridges "$port"
     uci set network.rt_iptv_dev='device'
@@ -207,7 +312,7 @@ configure_network() {
     if [ -n "${IGMP_VERSION:-}" ]; then
         case "$IGMP_VERSION" in
             1|2|3) uci set network.rt_iptv_dev.igmpversion="$IGMP_VERSION" ;;
-            *) die "IGMP_VERSION должен быть 1, 2 или 3." ;;
+            *) return 1 ;;
         esac
     fi
     uci set network.rt_iptv_lan='interface'
@@ -222,7 +327,7 @@ configure_network() {
         # L3 interface is created on the WAN device.
         :
     elif [ "$mode" = "vlan" ]; then
-        case "$wan_dev" in br-*|ppp*|tun*|wg*|*.*) die "Для VLAN нужен физический parent-интерфейс, а не $wan_dev. Для DSA используйте bridge VLAN через LuCI/UCI.";; esac
+        case "$wan_dev" in br-*|ppp*|tun*|wg*|*.*) return 1;; esac
         uci set network.rt_iptv_vlan='device'
         uci set network.rt_iptv_vlan.name="$wan_dev.$vid"
         uci set network.rt_iptv_vlan.type='8021q'
@@ -235,7 +340,7 @@ configure_network() {
         uci set network.rt_iptv.peerdns='0'
         uci set network.rt_iptv.delegate='0'
     else
-        die "Неизвестный режим сети: $mode"
+        return 1
     fi
 }
 configure_dhcp() { uci set dhcp.rt_iptv_dhcp='dhcp'; uci set dhcp.rt_iptv_dhcp.interface='rt_iptv_lan'; uci set dhcp.rt_iptv_dhcp.start='100'; uci set dhcp.rt_iptv_dhcp.limit='150'; uci set dhcp.rt_iptv_dhcp.leasetime='12h'; uci set dhcp.rt_iptv_dhcp.force='1'; }
@@ -247,8 +352,10 @@ configure_firewall() {
         fw_src='wan'
     fi
     uci set firewall.rt_iptv_igmp_accept='rule'; uci set firewall.rt_iptv_igmp_accept.name='Rostelecom IPTV IGMP upstream'; uci set firewall.rt_iptv_igmp_accept.src="$fw_src"; uci set firewall.rt_iptv_igmp_accept.proto='igmp'; uci set firewall.rt_iptv_igmp_accept.family='ipv4'; uci set firewall.rt_iptv_igmp_accept.target='ACCEPT'
-    uci set firewall.rt_iptv_downstream='zone'; uci set firewall.rt_iptv_downstream.name='rt_iptv_lan'; uci add_list firewall.rt_iptv_downstream.network='rt_iptv_lan'; uci set firewall.rt_iptv_downstream.input='ACCEPT'; uci set firewall.rt_iptv_downstream.output='ACCEPT'; uci set firewall.rt_iptv_downstream.forward='REJECT'
+    uci set firewall.rt_iptv_downstream='zone'; uci set firewall.rt_iptv_downstream.name='rt_iptv_lan'; uci add_list firewall.rt_iptv_downstream.network='rt_iptv_lan'; uci set firewall.rt_iptv_downstream.input='REJECT'; uci set firewall.rt_iptv_downstream.output='ACCEPT'; uci set firewall.rt_iptv_downstream.forward='REJECT'
     uci set firewall.rt_iptv_igmp_downstream='rule'; uci set firewall.rt_iptv_igmp_downstream.name='Rostelecom IPTV IGMP downstream'; uci set firewall.rt_iptv_igmp_downstream.src='rt_iptv_lan'; uci set firewall.rt_iptv_igmp_downstream.proto='igmp'; uci set firewall.rt_iptv_igmp_downstream.family='ipv4'; uci set firewall.rt_iptv_igmp_downstream.target='ACCEPT'
+    uci set firewall.rt_iptv_dhcp='rule'; uci set firewall.rt_iptv_dhcp.name='Rostelecom IPTV DHCP'; uci set firewall.rt_iptv_dhcp.src='rt_iptv_lan'; uci set firewall.rt_iptv_dhcp.proto='udp'; uci set firewall.rt_iptv_dhcp.src_port='68'; uci set firewall.rt_iptv_dhcp.dest_port='67'; uci set firewall.rt_iptv_dhcp.family='ipv4'; uci set firewall.rt_iptv_dhcp.target='ACCEPT'
+    uci set firewall.rt_iptv_dns='rule'; uci set firewall.rt_iptv_dns.name='Rostelecom IPTV DNS'; uci set firewall.rt_iptv_dns.src='rt_iptv_lan'; uci set firewall.rt_iptv_dns.proto='tcp udp'; uci set firewall.rt_iptv_dns.dest_port='53'; uci set firewall.rt_iptv_dns.family='ipv4'; uci set firewall.rt_iptv_dns.target='ACCEPT'
     uci set firewall.rt_iptv_multicast='rule'; uci set firewall.rt_iptv_multicast.name='Rostelecom IPTV multicast'; uci set firewall.rt_iptv_multicast.src="$fw_src"; uci set firewall.rt_iptv_multicast.dest='rt_iptv_lan'; uci set firewall.rt_iptv_multicast.family='ipv4'; uci set firewall.rt_iptv_multicast.proto='udp'; uci set firewall.rt_iptv_multicast.dest_ip='224.0.0.0/4'; uci set firewall.rt_iptv_multicast.target='ACCEPT'
 }
 configure_igmpproxy() {
@@ -267,26 +374,38 @@ install_hotplug() {
     if [ -f "$HOTPLUG_FILE" ] && ! grep -Fq "$PROJECT" "$HOTPLUG_FILE" 2>/dev/null; then
         cp "$HOTPLUG_FILE" "$HOTPLUG_BACKUP" || die "Не удалось сохранить существующий hotplug-файл."
     fi
-    cat > "$HOTPLUG_FILE" <<EOF2
+    tmp="$HOTPLUG_FILE.tmp.$$"
+    cat > "$tmp" <<EOF2
 #!/bin/sh
 # $PROJECT $VERSION
 [ "\$ACTION" = "ifup" ] || exit 0
 case "\$INTERFACE" in wan|rt_iptv) /etc/init.d/igmpproxy restart >/dev/null 2>&1 || true ;; esac
 exit 0
 EOF2
-    chmod +x "$HOTPLUG_FILE"
+    chmod +x "$tmp" || { rm -f "$tmp"; die "Не удалось сделать временный hotplug исполняемым."; }
+    mv "$tmp" "$HOTPLUG_FILE" || { rm -f "$tmp"; die "Не удалось установить hotplug-файл."; }
 }
+
 remove_hotplug() {
-    if [ -f "$HOTPLUG_FILE" ] && grep -Fq "$PROJECT" "$HOTPLUG_FILE" 2>/dev/null; then
-        if [ -f "$HOTPLUG_BACKUP" ]; then
-            cp "$HOTPLUG_BACKUP" "$HOTPLUG_FILE" && chmod +x "$HOTPLUG_FILE"
+    if [ -f "$HOTPLUG_BACKUP" ]; then
+        if [ ! -f "$HOTPLUG_FILE" ] || grep -Fq "$PROJECT" "$HOTPLUG_FILE" 2>/dev/null; then
+            if ! cp "$HOTPLUG_BACKUP" "$HOTPLUG_FILE" || ! chmod +x "$HOTPLUG_FILE"; then
+                log "Предупреждение: исходный hotplug не восстановлен; backup сохранён: $HOTPLUG_BACKUP"
+                return 1
+            fi
+            rm -f "$HOTPLUG_BACKUP" || { log "Предупреждение: не удалось удалить backup hotplug: $HOTPLUG_BACKUP"; return 1; }
         else
-            rm -f "$HOTPLUG_FILE"
+            log "ВНИМАНИЕ: $HOTPLUG_FILE изменён не проектом; исходный backup оставлен: $HOTPLUG_BACKUP"
+            return 1
         fi
+    elif [ -f "$HOTPLUG_FILE" ] && grep -Fq "$PROJECT" "$HOTPLUG_FILE" 2>/dev/null; then
+        rm -f "$HOTPLUG_FILE" || { log "Предупреждение: не удалось удалить project hotplug."; return 1; }
     fi
-    rm -f "$HOTPLUG_BACKUP"
+    return 0
 }
+
 rollback_project() {
+    INSTALL_ACTIVE=0
     # Automatic rollback is project-scoped. The explicit `restore` command
     # remains the full-file emergency restore path.
     port="${IPTV_PORT:-}"
@@ -294,7 +413,9 @@ rollback_project() {
     /etc/init.d/igmpproxy stop >/dev/null 2>&1 || true
     remove_owned_config
     [ -n "$port" ] && restore_port_membership "$port"
-    remove_hotplug
+    if ! remove_hotplug; then
+        log "ВНИМАНИЕ: hotplug не удалось полностью восстановить. Проверьте $HOTPLUG_FILE и $HOTPLUG_BACKUP"
+    fi
     rm -f "$CONFIG_FILE" "$STATE_DIR/iptv_port"
     uci commit network >/dev/null 2>&1 || true
     uci commit firewall >/dev/null 2>&1 || true
@@ -317,6 +438,8 @@ validate() {
         uci -q get network.wan >/dev/null || die "WAN interface не найден."
     fi
     uci -q get firewall.rt_iptv_multicast.dest_ip >/dev/null || die "Multicast firewall rule не создан."
+    uci -q get firewall.rt_iptv_dhcp.dest_port >/dev/null || die "DHCP firewall rule не создан."
+    uci -q get firewall.rt_iptv_dns.dest_port >/dev/null || die "DNS firewall rule не создан."
 }
 apply() {
     uci commit network || { rollback_project; die "Не удалось сохранить network. Проект откатан."; }
@@ -335,6 +458,7 @@ apply() {
 }
 write_state() {
     mode="$1"; port="$2"; wan="$3"; vid="${4:-}"
+    validate_port_name "$port" || return 1
     tmp="$CONFIG_FILE.tmp.$$"
     cat > "$tmp" <<EOF2
 VERSION=$VERSION
@@ -348,15 +472,23 @@ EOF2
     mv "$tmp" "$CONFIG_FILE" || { rm -f "$tmp"; return 1; }
 }
 post_check() {
-    log "\nПроверка после установки..."
+    log ""; log "Проверка после установки..."
     if [ "${mode_choice_network:-classic}" = "vlan" ] && uci -q get network.rt_iptv.device >/dev/null 2>&1; then
         log "✓ IPTV upstream: $(uci_get network.rt_iptv.device)"
     else
         log "✓ IPTV upstream: network.wan"
     fi
-    [ -d /sys/class/net/br-rt-iptv ] && log "✓ IPTV bridge: br-rt-iptv" || log "! Bridge ещё не поднялся"
-    pidof igmpproxy >/dev/null 2>&1 && log "✓ igmpproxy запущен" || log "! igmpproxy не запущен — запустите diagnose"
-    log "\nГотово. Подключите приставку к выбранному IPTV-порту и выполните: $0 status"
+    if [ -d /sys/class/net/br-rt-iptv ]; then
+        log "✓ IPTV bridge: br-rt-iptv"
+    else
+        log "! Bridge ещё не поднялся"
+    fi
+    if pidof igmpproxy >/dev/null 2>&1; then
+        log "✓ igmpproxy запущен"
+    else
+        log "! igmpproxy не запущен — запустите diagnose"
+    fi
+    log ""; log "Готово. Подключите приставку к выбранному IPTV-порту и выполните: $0 status"
 }
 
 install_wizard() {
@@ -379,6 +511,11 @@ install_wizard() {
             read -r vid
             printf "IPTV-порт приставки (например lan4): "
             read -r port
+            validate_port_name "$port" || die "Недопустимое имя IPTV-порта: $port"
+            log ""
+            log "Перед изменением будет создан backup."
+            log "Порт $port будет выделен под IPTV и при необходимости выведен из текущего bridge."
+            confirm "Продолжить установку VLAN?" || { log "Установка отменена."; return 0; }
             install_vlan_manual "$parent" "$vid" "$port"
             ;;
         *) die "Неизвестный вариант." ;;
@@ -391,7 +528,9 @@ install_vlan_manual() {
     [ ! -f "$CONFIG_FILE" ] || die "IPTV уже установлено. Сначала выполните uninstall."
     [ ! -f "$PORTMAP_FILE" ] || die "Обнаружено старое состояние portmap. Сначала выполните uninstall или удалите остатки проекта."
     ensure_igmpproxy
-    [ -n "$parent" ] && [ -n "$vid" ] && [ -n "$port" ] || die "Не заполнены параметры VLAN."
+    if [ -z "$parent" ] || [ -z "$vid" ] || [ -z "$port" ]; then
+        die "Не заполнены параметры VLAN."
+    fi
     [ -e "/sys/class/net/$parent/device" ] || die "Parent должен быть физическим интерфейсом: $parent"
     is_virtual_iface "$parent" && die "Parent не должен быть виртуальным интерфейсом: $parent"
     is_virtual_iface "$port" && die "IPTV-порт должен быть физическим Ethernet-портом: $port"
@@ -399,11 +538,13 @@ install_vlan_manual() {
     [ -e "/sys/class/net/$port/device" ] || die "IPTV-порт не найден: $port"
     [ "$parent" != "$port" ] || die "Parent и IPTV-порт не могут совпадать."
     assert_project_names_free
+    ensure_igmpproxy
     backup before-vlan-install
+    INSTALL_ACTIVE=1
     save_port_membership "$port"
     printf '%s\n' "$port" > "$STATE_DIR/iptv_port"
     mode_choice_network=vlan
-    configure_network "$port" "$parent" vlan "$vid"
+    configure_network "$port" "$parent" vlan "$vid" || die "Не удалось подготовить VLAN-конфигурацию."
     configure_dhcp
     configure_firewall
     configure_igmpproxy
@@ -414,38 +555,76 @@ install_vlan_manual() {
         rollback_project
         die "Не удалось сохранить состояние проекта. Проект откатан."
     fi
+    INSTALL_ACTIVE=0
     post_check
 }
 install_classic() {
-    is_root; [ ! -f "$CONFIG_FILE" ] || die "IPTV уже установлено. Сначала выполните uninstall, затем установите заново."; [ ! -f "$PORTMAP_FILE" ] || die "Обнаружено старое состояние portmap. Сначала выполните uninstall или удалите остатки проекта."; ensure_igmpproxy; select_port; port="$IPTV_PORT"; wan="$(detect_wan_device)"
+    is_root
+    [ ! -f "$CONFIG_FILE" ] || die "IPTV уже установлено. Сначала выполните uninstall, затем установите заново."
+    [ ! -f "$PORTMAP_FILE" ] || die "Обнаружено старое состояние portmap. Сначала выполните uninstall или удалите остатки проекта."
+    select_port
+    port="$IPTV_PORT"
+    wan="$(detect_wan_device)"
     uci -q get network.wan >/dev/null 2>&1 || die "Сеть network.wan не найдена."
-    assert_project_names_free; backup "before-install"; save_port_membership "$port"; printf '%s\n' "$port" > "$STATE_DIR/iptv_port"; mode_choice_network=classic; configure_network "$port" "$wan" classic; configure_dhcp; configure_firewall; configure_igmpproxy; install_hotplug; validate; apply; if ! write_state classic "$port" "$wan"; then rollback_project; die "Не удалось сохранить состояние проекта. Проект откатан."; fi; post_check
+    assert_project_names_free
+    confirm "Продолжить? Порт $port будет выделен под IPTV, backup будет создан автоматически." || { log "Установка отменена."; return 0; }
+    ensure_igmpproxy
+    backup "before-install"
+    INSTALL_ACTIVE=1
+    save_port_membership "$port"
+    printf '%s\n' "$port" > "$STATE_DIR/iptv_port" || { rollback_project; die "Не удалось сохранить выбранный IPTV-порт. Проект откатан."; }
+    mode_choice_network=classic
+    configure_network "$port" "$wan" classic || die "Не удалось подготовить Classic-конфигурацию."
+    configure_dhcp
+    configure_firewall
+    configure_igmpproxy
+    install_hotplug
+    validate
+    apply
+    if ! write_state classic "$port" "$wan"; then
+        rollback_project
+        die "Не удалось сохранить состояние проекта. Проект откатан."
+    fi
+    INSTALL_ACTIVE=0
+    post_check
 }
+
 install_vlan() {
     install_vlan_manual "${2:-}" "${3:-}" "${4:-}"
 }
 
 status() {
     is_root; header
-    [ -f "$CONFIG_FILE" ] && cat "$CONFIG_FILE" || log "Состояние проекта не найдено."
-    log "\n--- Сеть ---"; uci show network.rt_iptv 2>/dev/null || true; uci show network.rt_iptv_lan 2>/dev/null || true; uci show network.rt_iptv_dev 2>/dev/null || true; uci show network.rt_iptv_vlan 2>/dev/null || true
+    if [ -f "$CONFIG_FILE" ]; then
+        log "Статус: IPTV настроено"
+        cat "$CONFIG_FILE"
+    else
+        log "Статус: IPTV не настроено"
+    fi
+    log ""; log "--- Сеть ---"; uci show network.rt_iptv 2>/dev/null || true; uci show network.rt_iptv_lan 2>/dev/null || true; uci show network.rt_iptv_dev 2>/dev/null || true; uci show network.rt_iptv_vlan 2>/dev/null || true
     log "--- DHCP ---"; uci show dhcp.rt_iptv_dhcp 2>/dev/null || true
     log "--- Firewall ---"; uci show firewall | grep -E 'rt_iptv' 2>/dev/null || true
     log "--- IGMP ---"; uci show igmpproxy | grep -E 'rt_iptv' 2>/dev/null || true
     log "--- Интерфейсы ---"; ip -br link 2>/dev/null | grep -E 'br-rt-iptv|rt_iptv|lan|eth' || true
     log "--- igmpproxy ---"; pidof igmpproxy 2>/dev/null || log "не запущен"
-    command -v fw4 >/dev/null 2>&1 && { log "--- fw4 multicast ---"; fw4 print 2>/dev/null | grep -E 'rt_iptv|224\.0\.0\.0/4|igmpproxy' | tail -n 40 || true; }
+    if command -v fw4 >/dev/null 2>&1; then
+        log "--- fw4 multicast ---"
+        fw4 print 2>/dev/null | grep -E 'rt_iptv|224\.0\.0\.0/4|igmpproxy' | tail -n 40 || true
+    fi
 }
 diagnose() {
     is_root; header; log "OpenWrt: $(openwrt_version)"; log "WAN device: $(detect_wan_device)"
     log "WAN network: $(uci_get network.wan.proto)"
-    log "\n--- Адреса ---"; ip -br addr 2>/dev/null | grep -E 'rt_iptv|br-rt-iptv|wan|eth|lan' || true
+    log ""; log "--- Адреса ---"; ip -br addr 2>/dev/null | grep -E 'rt_iptv|br-rt-iptv|wan|eth|lan' || true
     log "--- Маршруты multicast ---"; ip route 2>/dev/null | grep -E '224\.0\.0\.0|10\.0\.0\.0/24|192\.168\.100\.0/24' || true
-    log "--- igmpproxy ---"; pidof igmpproxy 2>/dev/null || log "NOT RUNNING"
+    log "--- igmpproxy ---"; pidof igmpproxy 2>/dev/null || log "не запущен"
     log "--- Настроенные altnet ---"; uci -q show igmpproxy.rt_iptv_upstream.altnet 2>/dev/null || log "altnet не найден"
     log "--- Возможные сообщения о multicast source ---"; logread 2>/dev/null | grep -Ei 'igmpproxy|multicast|source|altnet|not allowed' | tail -n 100 || true
     log "--- /proc/net/igmp ---"; cat /proc/net/igmp 2>/dev/null || true
-    command -v fw4 >/dev/null 2>&1 && { log "--- Firewall ---"; fw4 print 2>/dev/null | grep -E 'rt_iptv|224\.0\.0\.0/4|igmpproxy' | tail -n 80 || true; }
+    if command -v fw4 >/dev/null 2>&1; then
+        log "--- Firewall ---"
+        fw4 print 2>/dev/null | grep -E 'rt_iptv|224\.0\.0\.0/4|igmpproxy' | tail -n 80 || true
+    fi
 }
 plan() {
     is_root; header
@@ -472,7 +651,27 @@ remove_altnet() {
     uci -q get igmpproxy.rt_iptv_upstream >/dev/null || die "Секция igmpproxy upstream не найдена."
     uci del_list igmpproxy.rt_iptv_upstream.altnet="$value" 2>/dev/null || true; uci commit igmpproxy || die "Не удалось сохранить altnet."; /etc/init.d/igmpproxy restart >/dev/null 2>&1 || true; log "Удалён altnet: $value"
 }
-uninstall() { is_root; backup before-uninstall; /etc/init.d/igmpproxy stop >/dev/null 2>&1 || true; port="$(cat "$STATE_DIR/iptv_port" 2>/dev/null || true)"; remove_owned_config; [ -n "$port" ] && restore_port_membership "$port"; remove_hotplug; uci commit network; uci commit firewall; uci commit dhcp; uci commit igmpproxy; /etc/init.d/network reload >/dev/null 2>&1 || true; /etc/init.d/firewall reload >/dev/null 2>&1 || true; /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true; /etc/init.d/igmpproxy restart >/dev/null 2>&1 || true; rm -f "$CONFIG_FILE" "$STATE_DIR/iptv_port" "$PORTMAP_FILE"; log "Удаление завершено. Backup сохранён: $BACKUP_DIR"; }
+uninstall() {
+    is_root
+    backup before-uninstall
+    /etc/init.d/igmpproxy stop >/dev/null 2>&1 || true
+    port="$(cat "$STATE_DIR/iptv_port" 2>/dev/null || true)"
+    remove_owned_config
+    if [ -n "$port" ]; then restore_port_membership "$port"; fi
+    if ! remove_hotplug; then
+        die "Не удалось полностью восстановить hotplug. Backup сохранён: $BACKUP_DIR"
+    fi
+    uci commit network || die "Не удалось сохранить network при удалении."
+    uci commit firewall || die "Не удалось сохранить firewall при удалении."
+    uci commit dhcp || die "Не удалось сохранить dhcp при удалении."
+    uci commit igmpproxy || die "Не удалось сохранить igmpproxy при удалении."
+    /etc/init.d/network reload >/dev/null 2>&1 || log "Предупреждение: network reload завершился ошибкой."
+    /etc/init.d/firewall reload >/dev/null 2>&1 || log "Предупреждение: firewall reload завершился ошибкой."
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || log "Предупреждение: dnsmasq restart завершился ошибкой."
+    /etc/init.d/igmpproxy restart >/dev/null 2>&1 || true
+    rm -f "$CONFIG_FILE" "$STATE_DIR/iptv_port" "$PORTMAP_FILE"
+    log "Удаление завершено. Backup сохранён: $BACKUP_DIR"
+}
 
 show_help() {
 cat <<EOF2
@@ -492,6 +691,7 @@ OpenWrt IPTV Ростелеком Manager $VERSION
   $0 backup              backup
   $0 restore             restore последнего backup
   $0 uninstall           удалить только конфигурацию проекта
+  $0 version             версия
   $0 help                помощь
 EOF2
 }
@@ -500,7 +700,7 @@ menu() {
     is_root
     while :; do
         header
-        printf '\n  1) Установить IPTV (мастер)\n  2) Проверить IPTV\n  3) Диагностика / исправление\n  4) Показать доступные порты\n  5) Показать настройки\n  6) Создать резервную копию\n  7) Удалить IPTV\n  0) Выход\n\nВыберите действие: '
+        printf '\n  1) Установить IPTV (мастер)\n  2) Проверить IPTV\n  3) Диагностика\n  4) Показать доступные порты\n  5) Показать настройки\n  6) Создать резервную копию\n  7) Удалить IPTV\n  8) Показать план установки\n  0) Выход\n\nВыберите действие: '
         read -r choice
         case "$choice" in
             1) install_wizard; pause_ui;;
@@ -510,6 +710,7 @@ menu() {
             5) show_config; pause_ui;;
             6) backup manual; pause_ui;;
             7) if confirm "Удалить IPTV-конфигурацию проекта?"; then uninstall; fi; pause_ui;;
+            8) plan; pause_ui;;
             0|q|Q) exit 0;;
             *) log "Неизвестный пункт."; pause_ui;;
         esac
@@ -531,6 +732,7 @@ case "$cmd" in
     backup) is_root; backup manual;;
     restore) is_root; restore_backup;;
     uninstall) uninstall;;
+    version|-v|--version) printf '%s\n' "$VERSION";;
     help|-h|--help) show_help;;
     *) die "Неизвестная команда: $cmd. Используйте: $0 help";;
 esac
