@@ -171,7 +171,7 @@ restore_backup() {
 detect_wan_device() { WAN_DEV="$(uci_get network.wan.device)"; [ -n "${WAN_DEV:-}" ] || WAN_DEV="$(uci_get network.wan.ifname)"; [ -n "${WAN_DEV:-}" ] || WAN_DEV=""; printf '%s' "$WAN_DEV"; }
 
 is_virtual_iface() {
-    case "$1" in lo|br-*|docker*|veth*|ppp*|tun*|wg*|sit*|gre*|gretap*|ip6tnl*|bond*|dummy*|ifb*) return 0;; esac
+    case "$1" in lo|br-*|docker*|veth*|ppp*|tun*|wg*|sit*|gre*|ip6tnl*|bond*|dummy*|ifb*) return 0;; esac
     return 1
 }
 list_ports() {
