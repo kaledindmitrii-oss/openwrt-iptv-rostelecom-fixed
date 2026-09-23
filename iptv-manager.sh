@@ -1,12 +1,12 @@
 #!/bin/sh
 # OpenWrt IPTV Rostelecom Manager
 # Independent project - NOT part of Universal OpenWrt
-# Version: 4.3.0
+# Version: 4.3.1
 # Simple interactive UI + safe UCI changes + multicast diagnostics.
 
 set -u
 
-VERSION="4.3.0"
+VERSION="4.3.1"
 PROJECT="iptv-rostelecom"
 STATE_DIR="/etc/iptv-rostelecom"
 BACKUP_DIR="/root/iptv-rostelecom-backups"
@@ -145,8 +145,12 @@ select_port() {
     is_virtual_iface "$IPTV_PORT" && die "Выберите физический Ethernet-порт: $IPTV_PORT"
     case "$IPTV_PORT" in *.*|*@*) die "Выберите физический Ethernet-порт: $IPTV_PORT";; esac
     [ -e "/sys/class/net/$IPTV_PORT/device" ] || die "Физический интерфейс не найден: $IPTV_PORT"
-    [ -n "$WAN_DEV" ] || die "Не удалось определить физический WAN. Используйте VLAN/DSA режим и укажите parent вручную."
-    [ "$IPTV_PORT" != "$WAN_DEV" ] || die "Нельзя выбрать WAN как IPTV-порт."
+    # Classic uses logical network.wan as igmpproxy upstream.
+    # The WAN device may be a VLAN or PPPoE parent, so it is not required
+    # to be a physical interface here.
+    if [ -n "$WAN_DEV" ] && [ "$IPTV_PORT" = "$WAN_DEV" ]; then
+        die "Нельзя выбрать WAN как IPTV-порт."
+    fi
 }
 
 remove_owned_config() {
@@ -171,7 +175,14 @@ configure_network() {
     uci set network.rt_iptv_dev.type='bridge'
     uci add_list network.rt_iptv_dev.ports="$port"
     uci set network.rt_iptv_dev.igmp_snooping='1'
-    uci set network.rt_iptv_dev.igmpversion='2'
+    # Do not force IGMPv2 by default. Set IGMP_VERSION=2 when the provider
+    # or the target device explicitly requires IGMPv2.
+    if [ -n "${IGMP_VERSION:-}" ]; then
+        case "$IGMP_VERSION" in
+            1|2|3) uci set network.rt_iptv_dev.igmpversion="$IGMP_VERSION" ;;
+            *) die "IGMP_VERSION должен быть 1, 2 или 3." ;;
+        esac
+    fi
     uci set network.rt_iptv_lan='interface'
     uci set network.rt_iptv_lan.proto='static'
     uci set network.rt_iptv_lan.device='br-rt-iptv'
@@ -246,6 +257,25 @@ remove_hotplug() {
     fi
     rm -f "$HOTPLUG_BACKUP"
 }
+rollback_project() {
+    # Automatic rollback is project-scoped. The explicit `restore` command
+    # remains the full-file emergency restore path.
+    port="${IPTV_PORT:-}"
+    [ -n "$port" ] || port="$(cat "$STATE_DIR/iptv_port" 2>/dev/null || true)"
+    /etc/init.d/igmpproxy stop >/dev/null 2>&1 || true
+    remove_owned_config
+    [ -n "$port" ] && restore_port_membership "$port"
+    remove_hotplug
+    rm -f "$CONFIG_FILE" "$STATE_DIR/iptv_port"
+    uci commit network >/dev/null 2>&1 || true
+    uci commit firewall >/dev/null 2>&1 || true
+    uci commit dhcp >/dev/null 2>&1 || true
+    uci commit igmpproxy >/dev/null 2>&1 || true
+    /etc/init.d/network reload >/dev/null 2>&1 || true
+    /etc/init.d/firewall reload >/dev/null 2>&1 || true
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    /etc/init.d/igmpproxy restart >/dev/null 2>&1 || true
+}
 validate() {
     uci show network >/dev/null || die "Ошибка UCI network."
     uci show firewall >/dev/null || die "Ошибка UCI firewall."
@@ -260,19 +290,19 @@ validate() {
     uci -q get firewall.rt_iptv_multicast.dest_ip >/dev/null || die "Multicast firewall rule не создан."
 }
 apply() {
-    uci commit network || { restore_backup; die "Не удалось сохранить network. Конфигурация откатана."; }
-    uci commit firewall || { restore_backup; die "Не удалось сохранить firewall. Конфигурация откатана."; }
-    uci commit dhcp || { restore_backup; die "Не удалось сохранить dhcp. Конфигурация откатана."; }
-    uci commit igmpproxy || { restore_backup; die "Не удалось сохранить igmpproxy. Конфигурация откатана."; }
+    uci commit network || { rollback_project; die "Не удалось сохранить network. Проект откатан."; }
+    uci commit firewall || { rollback_project; die "Не удалось сохранить firewall. Проект откатан."; }
+    uci commit dhcp || { rollback_project; die "Не удалось сохранить dhcp. Проект откатан."; }
+    uci commit igmpproxy || { rollback_project; die "Не удалось сохранить igmpproxy. Проект откатан."; }
     if ! /etc/init.d/network reload >/dev/null 2>&1; then
-        log "Сбой reload network — выполняю автоматический откат."
-        restore_backup
-        die "Network reload завершился ошибкой. Конфигурация откатана."
+        log "Сбой reload network — выполняю проектный откат."
+        rollback_project
+        die "Network reload завершился ошибкой. Проект откатан."
     fi
-    /etc/init.d/firewall reload >/dev/null 2>&1 || { restore_backup; die "Firewall reload завершился ошибкой. Конфигурация откатана."; }
-    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || { restore_backup; die "Dnsmasq restart завершился ошибкой. Конфигурация откатана."; }
+    /etc/init.d/firewall reload >/dev/null 2>&1 || { rollback_project; die "Firewall reload завершился ошибкой. Проект откатан."; }
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || { rollback_project; die "Dnsmasq restart завершился ошибкой. Проект откатан."; }
     /etc/init.d/igmpproxy enable >/dev/null 2>&1 || true
-    /etc/init.d/igmpproxy restart >/dev/null 2>&1 || { restore_backup; die "igmpproxy не запустился. Конфигурация откатана."; }
+    /etc/init.d/igmpproxy restart >/dev/null 2>&1 || { rollback_project; die "igmpproxy не запустился. Проект откатан."; }
 }
 write_state() {
     mode="$1"; port="$2"; wan="$3"; vid="${4:-}"
@@ -357,9 +387,8 @@ install_vlan_manual() {
 }
 install_classic() {
     is_root; [ ! -f "$CONFIG_FILE" ] || die "IPTV уже установлено. Сначала выполните uninstall, затем установите заново."; ensure_igmpproxy; select_port; port="$IPTV_PORT"; wan="$(detect_wan_device)"
-    [ -n "$wan" ] || die "Не удалось определить WAN device. Для этого роутера используйте явную VLAN/DSA настройку."
-    case "$wan" in br-*|ppp*|tun*|wg*|*.*) die "WAN device '$wan' не является простым физическим интерфейсом. Для VLAN/DSA используйте отдельную настройку через LuCI/UCI.";; esac
-    assert_project_names_free; backup "before-install"; save_port_membership "$port"; printf '%s\n' "$port" > "$STATE_DIR/iptv_port"; mode_choice_network=classic; configure_network "$port" "$wan" classic; configure_dhcp; configure_firewall; configure_igmpproxy; install_hotplug; validate; apply; if ! write_state classic "$port" "$wan"; then restore_backup; die "Не удалось сохранить состояние проекта. Конфигурация откатана."; fi; post_check
+    uci -q get network.wan >/dev/null 2>&1 || die "Сеть network.wan не найдена."
+    assert_project_names_free; backup "before-install"; save_port_membership "$port"; printf '%s\n' "$port" > "$STATE_DIR/iptv_port"; mode_choice_network=classic; configure_network "$port" "$wan" classic; configure_dhcp; configure_firewall; configure_igmpproxy; install_hotplug; validate; apply; if ! write_state classic "$port" "$wan"; then rollback_project; die "Не удалось сохранить состояние проекта. Проект откатан."; fi; post_check
 }
 install_vlan() {
     install_vlan_manual "${2:-}" "${3:-}" "${4:-}"
@@ -377,12 +406,14 @@ status() {
     command -v fw4 >/dev/null 2>&1 && { log "--- fw4 multicast ---"; fw4 print 2>/dev/null | grep -E 'rt_iptv|224\.0\.0\.0/4|igmpproxy' | tail -n 40 || true; }
 }
 diagnose() {
-    is_root; header; log "OpenWrt: $(openwrt_version)"; log "WAN: $(detect_wan_device)"
+    is_root; header; log "OpenWrt: $(openwrt_version)"; log "WAN device: $(detect_wan_device)"
+    log "WAN network: $(uci_get network.wan.proto)"
     log "\n--- Адреса ---"; ip -br addr 2>/dev/null | grep -E 'rt_iptv|br-rt-iptv|wan|eth|lan' || true
     log "--- Маршруты multicast ---"; ip route 2>/dev/null | grep -E '224\.0\.0\.0|10\.0\.0\.0/24|192\.168\.100\.0/24' || true
     log "--- igmpproxy ---"; pidof igmpproxy 2>/dev/null || log "NOT RUNNING"
+    log "--- Настроенные altnet ---"; uci -q show igmpproxy.rt_iptv_upstream.altnet 2>/dev/null || log "altnet не найден"
+    log "--- Возможные сообщения о multicast source ---"; logread 2>/dev/null | grep -Ei 'igmpproxy|multicast|source|altnet|not allowed' | tail -n 100 || true
     log "--- /proc/net/igmp ---"; cat /proc/net/igmp 2>/dev/null || true
-    log "--- Логи ---"; logread 2>/dev/null | grep -Ei 'igmp|igmpproxy|multicast|netifd' | tail -n 80 || true
     command -v fw4 >/dev/null 2>&1 && { log "--- Firewall ---"; fw4 print 2>/dev/null | grep -E 'rt_iptv|224\.0\.0\.0/4|igmpproxy' | tail -n 80 || true; }
 }
 plan() {
