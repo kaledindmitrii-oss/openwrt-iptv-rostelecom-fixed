@@ -1,4 +1,4 @@
-# Deep audit — v4.3.1
+# Deep audit — v4.3.2
 
 ## Scope
 
@@ -32,7 +32,7 @@
 
 Для DSA VLAN OpenWrt использует `bridge-vlan`; проект намеренно не создаёт такую топологию автоматически без данных о конкретном роутере и схеме провайдера.
 
-## 4.3.1 hardening
+## 4.3.2 hardening
 
 1. **Project-scoped automatic rollback** — критическая ошибка установки больше не восстанавливает целиком четыре `/etc/config/*` файла. Откатываются только проектные UCI-секции, выбранный IPTV-порт и проектный hotplug.
 2. **PPPoE/logical WAN** — Classic проверяет наличие `network.wan`, но не требует, чтобы `network.wan.device` был физическим `eth*`/`lan*`. Это позволяет не блокировать логические WAN topology без изменения WAN credentials.

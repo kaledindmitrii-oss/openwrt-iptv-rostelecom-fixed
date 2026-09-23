@@ -1,12 +1,16 @@
 # Changelog
 
-## 4.3.1
+## 4.3.2
+
+- GitHub Actions теперь используют actions/checkout и ludeeus/action-shellcheck по полным commit SHA; это устраняет отказ policy, требующей pinning всех actions.
+- Убраны небезопасные ShellCheck-паттерны с некавыченным word splitting там, где это не требуется; обработка UCI port/altnet сделана через явное разбиение.
+- Улучшена защита от stale `portmap`, а сохранение project state стало атомарным с проверкой chmod/mv.
 
 - Automatic rollback после ошибки установки теперь проектно-ограниченный: удаляются только созданные UCI-секции, восстанавливается исходное членство IPTV-порта и пользовательский hotplug. Полный file-level restore остаётся отдельной командой `restore`.
 - Classic больше не требует физического WAN device и не блокирует PPPoE/VLAN logical `network.wan`; upstream `igmpproxy` продолжает использовать логическую сеть `wan`.
 - Убран жёсткий `IGMPv2` по умолчанию. При необходимости версия задаётся через `IGMP_VERSION=1|2|3`.
 - `diagnose` показывает WAN protocol, настроенные `altnet` и расширенный фрагмент логов для поиска multicast source/allowlist проблем.
-- Версия проекта: 4.3.1.
+- Версия проекта: 4.3.2.
 
 
 ## 4.3.0

@@ -1,12 +1,12 @@
 #!/bin/sh
 # OpenWrt IPTV Rostelecom Manager
 # Independent project - NOT part of Universal OpenWrt
-# Version: 4.3.1
+# Version: 4.3.2
 # Simple interactive UI + safe UCI changes + multicast diagnostics.
 
 set -u
 
-VERSION="4.3.1"
+VERSION="4.3.2"
 PROJECT="iptv-rostelecom"
 STATE_DIR="/etc/iptv-rostelecom"
 BACKUP_DIR="/root/iptv-rostelecom-backups"
@@ -54,7 +54,16 @@ backup() {
     printf '%s\n' "$dir" > "$STATE_DIR/last_backup"
     log "Резервная копия: $dir"
 }
-latest_backup() { if [ -r "$STATE_DIR/last_backup" ]; then cat "$STATE_DIR/last_backup"; return 0; fi; ls -1dt "$BACKUP_DIR"/* 2>/dev/null | head -n 1; }
+latest_backup() {
+    if [ -r "$STATE_DIR/last_backup" ]; then
+        cat "$STATE_DIR/last_backup"
+        return 0
+    fi
+    for dir in "$BACKUP_DIR"/*; do
+        [ -d "$dir" ] || continue
+        printf '%s\n' "$dir"
+    done | sort | tail -n 1
+}
 restore_backup() {
     is_root
     dir="$(latest_backup)"; [ -n "$dir" ] && [ -d "$dir" ] || die "Резервная копия не найдена."
@@ -109,9 +118,14 @@ save_port_membership() {
     port="$1"
     [ -s "$PORTMAP_FILE" ] && return 0
     : > "$PORTMAP_FILE"
-    for sec in $(uci show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=device$/\1/p'); do
-        name="$(uci_get "network.$sec.name")"; ports="$(uci_get "network.$sec.ports")"; [ -n "$name" ] || continue
-        for item in $ports; do [ "$item" = "$port" ] && printf '%s\t%s\n' "$name" "$ports" >> "$PORTMAP_FILE"; done
+    uci show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=device$/\1/p' | while IFS= read -r sec; do
+        [ -n "$sec" ] || continue
+        name="$(uci_get "network.$sec.name")"
+        ports="$(uci_get "network.$sec.ports")"
+        [ -n "$name" ] || continue
+        printf '%s\n' "$ports" | tr ' ' '\n' | while IFS= read -r item; do
+            [ "$item" = "$port" ] && printf '%s\t%s\n' "$name" "$ports" >> "$PORTMAP_FILE"
+        done
     done
 }
 restore_port_membership() {
@@ -119,19 +133,32 @@ restore_port_membership() {
     [ -n "$port" ] || return 0
     [ -r "$PORTMAP_FILE" ] || return 0
     while IFS="$(printf '\t')" read -r name ports; do
-        [ -n "$name" ] || continue; found=""
-        for sec in $(uci show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=device$/\1/p'); do [ "$(uci_get "network.$sec.name")" = "$name" ] && { found="$sec"; break; }; done
+        [ -n "$name" ] || continue
+        found=""
+        while IFS= read -r sec; do
+            [ "$(uci_get "network.$sec.name")" = "$name" ] && { found="$sec"; break; }
+        done <<EOF3
+$(uci show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=device$/\1/p')
+EOF3
         [ -n "$found" ] || continue
         uci del_list "network.$found.ports=$port" 2>/dev/null || true
-        for item in $ports; do uci add_list "network.$found.ports=$item"; done
+        printf '%s\n' "$ports" | tr ' ' '\n' | while IFS= read -r item; do
+            [ -n "$item" ] && uci add_list "network.$found.ports=$item"
+        done
     done < "$PORTMAP_FILE"
 }
 remove_port_from_bridges() {
     port="$1"
-    for sec in $(uci show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=device$/\1/p'); do
-        ports="$(uci_get "network.$sec.ports")"; [ -n "$ports" ] || continue
-        for item in $ports; do [ "$item" = "$port" ] && uci del_list "network.$sec.ports=$port" 2>/dev/null || true; done
-    done
+    while IFS= read -r sec; do
+        [ -n "$sec" ] || continue
+        ports="$(uci_get "network.$sec.ports")"
+        [ -n "$ports" ] || continue
+        printf '%s\n' "$ports" | tr ' ' '\n' | while IFS= read -r item; do
+            [ "$item" = "$port" ] && uci del_list "network.$sec.ports=$port" 2>/dev/null || true
+        done
+    done <<EOF3
+$(uci show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=device$/\1/p')
+EOF3
 }
 
 select_port() {
@@ -139,7 +166,7 @@ select_port() {
     log "WAN: $WAN_DEV"
     log "\nФизические Ethernet-порты:"
     ports="$(list_ports)"; [ -n "$ports" ] || die "Физические Ethernet-порты не найдены."
-    printf '  %s\n' $ports
+    printf '%s\n' "$ports" | tr ' ' '\n' | while IFS= read -r item; do printf '  %s\n' "$item"; done
     printf '\nВведите порт IPTV (например lan4): '; read -r IPTV_PORT
     [ -n "$IPTV_PORT" ] || die "Порт не указан."
     is_virtual_iface "$IPTV_PORT" && die "Выберите физический Ethernet-порт: $IPTV_PORT"
@@ -231,11 +258,13 @@ configure_igmpproxy() {
     else
         uci set igmpproxy.rt_iptv_upstream='phyint'; uci set igmpproxy.rt_iptv_upstream.network='rt_iptv'; uci set igmpproxy.rt_iptv_upstream.zone='rt_iptv_upstream'; uci set igmpproxy.rt_iptv_upstream.direction='upstream'
     fi
-    for ip in $ALTNETS; do uci add_list igmpproxy.rt_iptv_upstream.altnet="$ip"; done
+    printf '%s\n' "$ALTNETS" | tr ' ' '\n' | while IFS= read -r ip; do
+        [ -n "$ip" ] && uci add_list igmpproxy.rt_iptv_upstream.altnet="$ip"
+    done
     uci set igmpproxy.rt_iptv_downstream='phyint'; uci set igmpproxy.rt_iptv_downstream.network='rt_iptv_lan'; uci set igmpproxy.rt_iptv_downstream.zone='rt_iptv_lan'; uci set igmpproxy.rt_iptv_downstream.direction='downstream'
 }
 install_hotplug() {
-    if [ -f "$HOTPLUG_FILE" ] && ! grep -q "$PROJECT" "$HOTPLUG_FILE" 2>/dev/null; then
+    if [ -f "$HOTPLUG_FILE" ] && ! grep -Fq "$PROJECT" "$HOTPLUG_FILE" 2>/dev/null; then
         cp "$HOTPLUG_FILE" "$HOTPLUG_BACKUP" || die "Не удалось сохранить существующий hotplug-файл."
     fi
     cat > "$HOTPLUG_FILE" <<EOF2
@@ -248,7 +277,7 @@ EOF2
     chmod +x "$HOTPLUG_FILE"
 }
 remove_hotplug() {
-    if [ -f "$HOTPLUG_FILE" ] && grep -q "$PROJECT" "$HOTPLUG_FILE" 2>/dev/null; then
+    if [ -f "$HOTPLUG_FILE" ] && grep -Fq "$PROJECT" "$HOTPLUG_FILE" 2>/dev/null; then
         if [ -f "$HOTPLUG_BACKUP" ]; then
             cp "$HOTPLUG_BACKUP" "$HOTPLUG_FILE" && chmod +x "$HOTPLUG_FILE"
         else
@@ -315,7 +344,8 @@ WAN_DEVICE=$wan
 VLAN_ID=$vid
 INSTALLED_AT=$(date '+%Y-%m-%d %H:%M:%S')
 EOF2
-    mv "$tmp" "$CONFIG_FILE"
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$CONFIG_FILE" || { rm -f "$tmp"; return 1; }
 }
 post_check() {
     log "\nПроверка после установки..."
@@ -359,6 +389,7 @@ install_vlan_manual() {
     is_root
     parent="${1:-}"; vid="${2:-}"; port="${3:-}"
     [ ! -f "$CONFIG_FILE" ] || die "IPTV уже установлено. Сначала выполните uninstall."
+    [ ! -f "$PORTMAP_FILE" ] || die "Обнаружено старое состояние portmap. Сначала выполните uninstall или удалите остатки проекта."
     ensure_igmpproxy
     [ -n "$parent" ] && [ -n "$vid" ] && [ -n "$port" ] || die "Не заполнены параметры VLAN."
     [ -e "/sys/class/net/$parent/device" ] || die "Parent должен быть физическим интерфейсом: $parent"
@@ -380,13 +411,13 @@ install_vlan_manual() {
     validate
     apply
     if ! write_state vlan "$port" "$parent" "$vid"; then
-        restore_backup
-        die "Не удалось сохранить состояние проекта. Конфигурация откатана."
+        rollback_project
+        die "Не удалось сохранить состояние проекта. Проект откатан."
     fi
     post_check
 }
 install_classic() {
-    is_root; [ ! -f "$CONFIG_FILE" ] || die "IPTV уже установлено. Сначала выполните uninstall, затем установите заново."; ensure_igmpproxy; select_port; port="$IPTV_PORT"; wan="$(detect_wan_device)"
+    is_root; [ ! -f "$CONFIG_FILE" ] || die "IPTV уже установлено. Сначала выполните uninstall, затем установите заново."; [ ! -f "$PORTMAP_FILE" ] || die "Обнаружено старое состояние portmap. Сначала выполните uninstall или удалите остатки проекта."; ensure_igmpproxy; select_port; port="$IPTV_PORT"; wan="$(detect_wan_device)"
     uci -q get network.wan >/dev/null 2>&1 || die "Сеть network.wan не найдена."
     assert_project_names_free; backup "before-install"; save_port_membership "$port"; printf '%s\n' "$port" > "$STATE_DIR/iptv_port"; mode_choice_network=classic; configure_network "$port" "$wan" classic; configure_dhcp; configure_firewall; configure_igmpproxy; install_hotplug; validate; apply; if ! write_state classic "$port" "$wan"; then rollback_project; die "Не удалось сохранить состояние проекта. Проект откатан."; fi; post_check
 }
