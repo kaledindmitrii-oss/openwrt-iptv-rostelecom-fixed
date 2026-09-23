@@ -1,67 +1,52 @@
 # Changelog
 
-## 4.3.0
+## 5.5.0
+- Added explicit Shared-WAN profile for verified PPPoE + physical WAN/L2 IPTV topologies.
+- Added conservative DSA bridge-vlan profile without guessing switch/CPU topology.
+- Added topology guards for both profiles.
+- Extended runtime post-checks for DSA VLAN interfaces.
+- Kept legacy VLAN mode blocked on DSA.
+- Updated GitHub-ready documentation and static checks.
 
-- Убран дублирующий `network.rt_iptv` из Classic: upstream igmpproxy напрямую использует существующую `network.wan`. Это уменьшает риск конфликтов netifd на одном физическом WAN device.
-- Добавлена проверка конфликтов проектных UCI-секций до изменения конфигурации.
-- Backup теперь создаётся до изменения выбранного IPTV-порта и включает состояние проекта, portmap и hotplug.
-- Rollback восстанавливает не только UCI, но и проектный hotplug/state.
-- Исправлена последовательность транзакции установки: backup → сохранение исходного членства порта → UCI-изменения → commit/reload → state.
-- `altnet` нормализуется к CIDR (`/32` для одиночного IPv4), поддерживается ввод сети IPv4/CIDR и предотвращаются дубликаты.
-- Добавлена команда `plan` для безопасного просмотра обнаруженной топологии и ограничений без изменений.
-- Улучшены сообщения статуса для Classic/VLAN.
-- DSA bridge-vlan по-прежнему не угадывается и не создаётся автоматически.
+# Changelog
 
+## 5.4.0 — Deep audit fixes
 
-## 4.2.1
+- Deep safety rebuild on top of v5.0 architecture.
+- Clean-UCI precondition before mutating install/uninstall/restore flows.
+- DSA `bridge-vlan` membership is saved, removed and restored alongside bridge device ports.
+- Transaction lock is acquired for every mutating/diagnostic command except help/version.
+- Rollback no longer performs broad `uci revert`; it removes only project-owned sections and restores captured port membership.
+- Backup captures project state, portmap, altnets, hotplug and igmpproxy service state.
+- Restore creates a pre-restore backup and restores project state coherently.
+- Uninstall preserves the original igmpproxy enabled/running state.
+- Runtime altnet changes are applied to igmpproxy and rolled back if restart fails.
+- Stronger post-install checks for bridge, VLAN runtime interface, firewall, DHCP and igmpproxy.
+- Atomic hotplug handling and safer rollback retention.
+- Backup MANIFEST and complete missing-state markers added; restore now restores original hotplug state coherently.
+- Stale lock detection added.
+- Multi-value altnet rollback fixed.
+- No remote downloads, WAN MAC changes or PPPoE credential handling.
 
-- Исправлен Classic режим: больше не создаётся искусственный `10.0.0.1/24` на физическом WAN.
-- Classic использует существующую OpenWrt-сеть `wan` как upstream для igmpproxy.
-- Для VLAN upstream остаётся отдельным `rt_iptv` и получает адрес по DHCP; VLAN ID задаётся явно, без угадывания.
-- Firewall multicast теперь использует правильную upstream-зону для Classic и VLAN.
-- Backup теперь сохраняет `hotplug.missing`, поэтому restore корректно возвращает отсутствие пользовательского hotplug-файла.
-- Добавлен автоматический откат при критической ошибке commit/reload/start после установки.
-- Проект по-прежнему не изменяет WAN MAC, PPPoE credentials и не скачивает конфигурации удалённо.
+## 5.3.0 — Clean rebuild
 
-## 4.2.0
+- Initial clean rebuild baseline; see git history for the full 5.3.0 change set.
 
-- Исправлен критический баг восстановления портов: `restore_port_membership` теперь получает порт явно и безопасен при `set -u`.
-- Существующий пользовательский hotplug сохраняется перед установкой и восстанавливается при удалении проекта.
-- Убран опасный fallback к логическому имени `wan` как к device.
-- Добавлены проверки root/OpenWrt/базовых команд.
-- Улучшены формулировки интерактивного меню для обычного пользователя.
-- Добавлен мастер установки с пошаговым выбором Classic/VLAN.
-- Документация явно предупреждает о PPPoE/VLAN/DSA топологиях.
+# Changelog
 
+## 5.3.0 — Clean rebuild
 
-## 4.1.1
-
-- Исправлено повторное сохранение IPTV-порта: исходное членство порта в bridge теперь не затирается при повторном запуске установщика.
-- Повторная установка теперь требует явного `uninstall`, чтобы не создавать накопленные UCI-конфликты.
-- Backup хранит информацию об отсутствующих `/etc/config/*` файлах и корректнее выполняет rollback.
-- Исправлено восстановление списка портов: перед возвратом удаляются дубликаты.
-- `add-altnet` / `remove-altnet` теперь требуют установленную конфигурацию.
-- Версия проекта: 4.1.1.
-
-## 4.1.0
-
-- Исправлено управление `list ports`: теперь используются `uci add_list` / `uci del_list`, а не превращение списка портов в обычную строку.
-- Убраны ошибочные исключения `eth0`/`eth1`: физические интерфейсы определяются через `/sys/class/net/*/device`.
-- Убрана автоматическая настройка PPPoE из IPTV-установки: WAN теперь не изменяется установщиком.
-- Добавлен простой интерактивный режим без аргументов.
-- Добавлена автоматическая проверка после установки.
-- Hotplug перенесён на отдельный файл `99-iptv-rostelecom`, без перезаписи существующего пользовательского hook-файла.
-- Усилена проверка VLAN parent: автоматическая DSA VLAN-схема не угадывается.
-- Добавлена защита от установки на virtual/bridge/VLAN интерфейс вместо физического порта.
-- Улучшена читаемость CLI и сообщений об ошибках.
-- Версия проекта: 4.1.0.
-
-## 4.0.0
-
-- Добавлен явный `install-vlan` без угадывания VLAN.
-- Добавлена расширенная диагностика multicast/IGMP/fw4.
-- Добавлены `list-ports`, `show-config`, `backup`, `remove-altnet`.
-- Добавлен hotplug для перезапуска igmpproxy после WAN/rt_iptv ifup.
-- Убран hard-coded WAN MAC.
-- Нет полной перезаписи пользовательских `/etc/config/*`.
-- Поддержаны `apk` и `opkg`.
+- Полностью пересобран проект вместо последовательных patch v4.3.x.
+- Новая транзакционная архитектура установки.
+- Защита WAN/management bridge path с bounded recursive topology check.
+- Classic использует существующий `network.wan` без второго L3-интерфейса на WAN.
+- Legacy VLAN отделён и требует явный физический parent + VLAN ID.
+- DSA обнаруживается и блокирует legacy VLAN wizard вместо угадывания bridge-vlan схемы.
+- Project rollback не заменяет целиком пользовательские конфиги.
+- Full restore оставлен отдельной явно подтверждаемой операцией.
+- Атомарный hotplug install/restore.
+- `opkg` и `apk`.
+- `status`, `diagnose`, `plan`, `list-ports`, `show-config`, `backup`, `restore`, `uninstall`.
+- Управление `altnet`.
+- IGMP version не принуждается по умолчанию.
+- CI переведён на прямой ShellCheck без стороннего action.
